@@ -16,7 +16,6 @@ st.set_page_config(page_title="RAG Chatbot", layout="wide")
 
 # --- AUTHENTICATION LOGIC ---
 api_key = st.secrets.get("GROQ_API_KEY")
-
 if not api_key:
     try:
         from dotenv import load_dotenv
@@ -29,10 +28,38 @@ if not api_key:
     with st.sidebar:
         st.header("⚙️ Configuration")
         api_key = st.text_input("Groq API Key", type="password")
+    if not api_key:
+        st.warning("Please configure the Groq API Key to continue.")
+        st.stop()
 
-if not api_key:
-    st.warning("Please configure the Groq API Key to continue.")
+# --- CACHED RESOURCE LOADING (The Fix for "Oh No" Errors) ---
+@st.cache_resource
+def load_embedder():
+    return TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+
+@st.cache_resource
+def get_chroma_client():
+    # Use a temp directory that persists for the session
+    DB_DIR = os.path.join(tempfile.gettempdir(), "chroma_db_persistent")
+    return chromadb.PersistentClient(
+        path=DB_DIR, 
+        settings=Settings(anonymized_telemetry=False)
+    )
+
+# Load resources using the cache
+try:
+    client = Groq(api_key=api_key)
+    embedder = load_embedder()        # Only loads once!
+    chroma_client = get_chroma_client() # Only connects once!
+except Exception as e:
+    st.error(f"Error initializing models: {e}")
     st.stop()
+
+def get_collection():
+    return chroma_client.get_or_create_collection(
+        name="rag_collection",
+        metadata={"hnsw:space": "cosine"}
+    )
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -44,27 +71,6 @@ with st.sidebar:
         accept_multiple_files=True
     )
     process_btn = st.button("Process & Train")
-
-# --- INITIALIZE CLIENTS ---
-try:
-    client = Groq(api_key=api_key)
-    embedder = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
-except Exception as e:
-    st.error(f"Error initializing models: {e}")
-    st.stop()
-
-# --- DATABASE SETUP ---
-DB_DIR = os.path.join(tempfile.gettempdir(), "chroma_db")
-chroma_client = chromadb.PersistentClient(
-    path=DB_DIR, 
-    settings=Settings(anonymized_telemetry=False)
-)
-
-def get_collection():
-    return chroma_client.get_or_create_collection(
-        name="rag_collection",
-        metadata={"hnsw:space": "cosine"}
-    )
 
 # --- PROCESSING LOGIC ---
 if process_btn and uploaded_files:
@@ -90,15 +96,12 @@ if process_btn and uploaded_files:
             elif file.name.endswith(".txt"):
                 text = file.read().decode("utf-8")
             
-            # --- UPGRADE: SMART CHUNKING ---
-            # Instead of splitting by line, we group text into chunks of 1000 characters.
+            # Smart Chunking
             chunk_size = 1000
             overlap = 200
-            
-            # Simple sliding window
             for i in range(0, len(text), chunk_size - overlap):
                 chunk = text[i : i + chunk_size]
-                if len(chunk) > 50: # Ignore tiny chunks
+                if len(chunk) > 50:
                     all_chunks.append(chunk)
                     
         except Exception as e:
@@ -119,9 +122,9 @@ if process_btn and uploaded_files:
             collection.add(documents=batch, embeddings=embeddings, ids=ids)
             progress_bar.progress(min((i + BATCH_SIZE) / total_chunks, 1.0))
         
-        status.success(f"Success! Processed {total_chunks} blocks. The AI can now read full paragraphs.")
+        status.success(f"Success! Processed {total_chunks} blocks.")
     else:
-        status.error("No valid text found in documents.")
+        status.error("No valid text found.")
 
 # --- CHAT INTERFACE ---
 if "messages" not in st.session_state:
@@ -139,25 +142,20 @@ if prompt := st.chat_input("Ask about your documents..."):
     collection = get_collection()
     try:
         q_embed = list(embedder.embed([prompt]))[0].tolist()
-        results = collection.query(query_embeddings=[q_embed], n_results=10) # 10 chunks is good for paragraphs
+        results = collection.query(query_embeddings=[q_embed], n_results=10)
         
         if results['documents'] and results['documents'][0]:
             context = "\n\n".join(results['documents'][0])
-            
             sys_prompt = f"""
             You are a helpful expert assistant. Your task is to answer the user's question based ONLY on the provided context.
+            If the answer is not in the context, say "I don't know".
             
-            Context from documents:
+            Context:
             {context}
             
-            User Question:
+            Question:
             {prompt}
-            
-            Instructions:
-            1. If the context contains multiple job descriptions or topics, compare them clearly.
-            2. If the answer is not in the context, say "I don't know".
             """
-            
             response = client.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 messages=[{"role": "user", "content": sys_prompt}]
