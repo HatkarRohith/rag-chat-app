@@ -15,10 +15,8 @@ from groq import Groq
 st.set_page_config(page_title="RAG Chatbot", layout="wide")
 
 # --- AUTHENTICATION LOGIC ---
-# 1. Try to get key from Streamlit Cloud Secrets first
 api_key = st.secrets.get("GROQ_API_KEY")
 
-# 2. If not found in Secrets, try local .env file (for local testing)
 if not api_key:
     try:
         from dotenv import load_dotenv
@@ -27,18 +25,16 @@ if not api_key:
     except:
         pass
 
-# 3. If STILL not found, ask the user to enter it manually
 if not api_key:
     with st.sidebar:
         st.header("⚙️ Configuration")
         api_key = st.text_input("Groq API Key", type="password")
 
-# Stop the app if we still don't have a key
 if not api_key:
     st.warning("Please configure the Groq API Key to continue.")
     st.stop()
 
-# --- SIDEBAR: DOCUMENT UPLOAD ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.divider()
     st.header("📂 Document Management")
@@ -57,8 +53,7 @@ except Exception as e:
     st.error(f"Error initializing models: {e}")
     st.stop()
 
-# --- SETUP DATABASE ---
-# We use a temporary directory for the cloud to avoid permission errors
+# --- DATABASE SETUP ---
 DB_DIR = os.path.join(tempfile.gettempdir(), "chroma_db")
 chroma_client = chromadb.PersistentClient(
     path=DB_DIR, 
@@ -71,22 +66,20 @@ def get_collection():
         metadata={"hnsw:space": "cosine"}
     )
 
-# --- DOCUMENT PROCESSING LOGIC ---
+# --- PROCESSING LOGIC ---
 if process_btn and uploaded_files:
     status = st.empty()
     progress_bar = st.progress(0)
-    
     status.text("Processing files...")
     
-    # 1. Reset Collection (Clear old data)
     try:
         chroma_client.delete_collection("rag_collection")
     except:
-        pass  # Collection might not exist yet
+        pass
     collection = get_collection()
     
-    # 2. Read and Text Extraction
     all_chunks = []
+    
     for file in uploaded_files:
         text = ""
         try:
@@ -97,79 +90,72 @@ if process_btn and uploaded_files:
             elif file.name.endswith(".txt"):
                 text = file.read().decode("utf-8")
             
-            # Simple chunking by newlines
-            chunks = [line.strip() for line in text.split('\n') if line.strip()]
-            all_chunks.extend(chunks)
+            # --- UPGRADE: SMART CHUNKING ---
+            # Instead of splitting by line, we group text into chunks of 1000 characters.
+            chunk_size = 1000
+            overlap = 200
+            
+            # Simple sliding window
+            for i in range(0, len(text), chunk_size - overlap):
+                chunk = text[i : i + chunk_size]
+                if len(chunk) > 50: # Ignore tiny chunks
+                    all_chunks.append(chunk)
+                    
         except Exception as e:
             st.error(f"Error reading file {file.name}: {e}")
             continue
         
-    # 3. Batch Embed & Insert (Safety Batching)
-    BATCH_SIZE = 500  # Safe limit to prevent crashing
+    # Batch Insert
+    BATCH_SIZE = 200
     total_chunks = len(all_chunks)
     
     if total_chunks > 0:
-        status.text(f"Embedding {total_chunks} chunks...")
+        status.text(f"Embedding {total_chunks} text blocks...")
         for i in range(0, total_chunks, BATCH_SIZE):
             batch = all_chunks[i : i + BATCH_SIZE]
-            
-            # Generate Embeddings
             embeddings = list(embedder.embed(batch))
             embeddings = [e.tolist() for e in embeddings]
-            
-            # Create unique IDs
             ids = [f"id_{i+j}" for j in range(len(batch))]
-            
-            # Add to Database
             collection.add(documents=batch, embeddings=embeddings, ids=ids)
-            
-            # Update Progress Bar
             progress_bar.progress(min((i + BATCH_SIZE) / total_chunks, 1.0))
         
-        status.success(f"Success! Processed {total_chunks} chunks. You can now chat.")
+        status.success(f"Success! Processed {total_chunks} blocks. The AI can now read full paragraphs.")
     else:
-        status.error("No valid text found in the uploaded documents.")
+        status.error("No valid text found in documents.")
 
 # --- CHAT INTERFACE ---
-# This is the part that was likely missing or broken before
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Display Chat History
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
 
-# Handle User Input
-if prompt := st.chat_input("Ask a question about your documents..."):
-    # 1. Display User Message
+if prompt := st.chat_input("Ask about your documents..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.write(prompt)
 
-    # 2. Retrieve Context
     collection = get_collection()
     try:
-        # Generate embedding for the question
         q_embed = list(embedder.embed([prompt]))[0].tolist()
-        
-        # Search ChromaDB
-        # UPGRADE: Increased to 15 to help with "Comparison" questions
-        results = collection.query(query_embeddings=[q_embed], n_results=15)
+        results = collection.query(query_embeddings=[q_embed], n_results=10) # 10 chunks is good for paragraphs
         
         if results['documents'] and results['documents'][0]:
-            context = "\n".join(results['documents'][0])
+            context = "\n\n".join(results['documents'][0])
             
-            # 3. Generate Answer with Groq
             sys_prompt = f"""
-            You are a helpful assistant. Use the following context to answer the user's question.
-            If the answer is not in the context, say you don't know.
+            You are a helpful expert assistant. Your task is to answer the user's question based ONLY on the provided context.
             
-            Context:
+            Context from documents:
             {context}
             
-            Question:
+            User Question:
             {prompt}
+            
+            Instructions:
+            1. If the context contains multiple job descriptions or topics, compare them clearly.
+            2. If the answer is not in the context, say "I don't know".
             """
             
             response = client.chat.completions.create(
@@ -178,12 +164,11 @@ if prompt := st.chat_input("Ask a question about your documents..."):
             )
             answer = response.choices[0].message.content
         else:
-            answer = "I couldn't find any relevant information in the uploaded documents."
+            answer = "I couldn't find relevant info in the docs."
             
     except Exception as e:
-        answer = f"An error occurred: {str(e)}"
+        answer = f"Error: {str(e)}"
 
-    # 4. Display Assistant Message
     st.session_state.messages.append({"role": "assistant", "content": answer})
     with st.chat_message("assistant"):
         st.write(answer)
