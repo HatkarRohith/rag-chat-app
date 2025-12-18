@@ -130,9 +130,17 @@ if process_btn and uploaded_files:
     else:
         status.error("No valid text found in the uploaded documents.")
 
-# --- CHAT INTERFACE ---
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# ... inside the chat interface ...
+    
+    # Search ChromaDB
+    # CHANGED: Increased from 5 to 15 so it can see multiple documents at once
+    results = collection.query(query_embeddings=[q_embed], n_results=15)
+    
+    if results['documents'] and results['documents'][0]:
+        context = "\n".join(results['documents'][0])
+        
+        # 3. Generate Answer with Groq
+        # ... rest of the code ...
 
 # Display Chat History
 for msg in st.session_state.messages:
@@ -185,3 +193,4 @@ if prompt := st.chat_input("Ask a question about your documents..."):
     st.session_state.messages.append({"role": "assistant", "content": answer})
     with st.chat_message("assistant"):
         st.write(answer)
+
