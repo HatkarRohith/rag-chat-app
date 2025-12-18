@@ -1,0 +1,6 @@
+streamlit
+fastembed
+pypdf
+chromadb
+groq
+pysqlite3-binary
